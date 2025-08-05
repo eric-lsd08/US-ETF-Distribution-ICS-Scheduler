@@ -8,11 +8,11 @@ from datetime import datetime, timedelta
 from PyPDF2 import PdfReader
 
 # ==== Configuration ====
-# Set your desired ETF ticker and output options here:
-TICKER = "SGOV"          # e.g., "SGOV" or "EWJ"
-WRITE_DECL = True        # Write declaration_date ICS?
-WRITE_EX = False          # Write ex_date ICS?
-WRITE_PAY = False         # Write pay_date ICS?
+# Provide a comma-separated list of ETF tickers here, e.g. "SGOV,EWJ,SPY"
+TICKERS = "SGOV,EWJ"
+WRITE_DECL = True   # Write declaration_date ICS?
+WRITE_EX = False    # Write ex_date ICS?
+WRITE_PAY = False   # Write pay_date ICS?
 PDF_URL = (
     "https://www.ishares.com/us/literature/shareholder-letters/"
     "isharesandblackrocketfsdistributionschedule.pdf"
@@ -34,17 +34,17 @@ def extract_text(pdf_bytes: bytes) -> str:
 def parse_dates(text: str, marker: str):
     idx_mark = text.rfind(marker)
     if idx_mark < 0:
-        raise RuntimeError(f"Ticker '{marker.strip()}' not found")
+        raise RuntimeError(f"Ticker '{marker.strip()}' not found in PDF")
     snippet = text[:idx_mark]
     purpose_positions = [m.start() for m in re.finditer("Purposes", snippet)]
     if not purpose_positions:
-        raise RuntimeError("'Purposes' keyword not found before ticker")
-
+        raise RuntimeError("'Purposes' keyword not found before ticker block")
     start_idx = purpose_positions[-1]
     block = snippet[start_idx:].splitlines()
 
     decl_blocks, ex_blocks, pay_blocks = [], [], []
     cur, buf = None, []
+
     for line in block:
         if line.startswith("DECLARATION DATE:"):
             if cur and buf:
@@ -61,17 +61,18 @@ def parse_dates(text: str, marker: str):
         else:
             if cur and line.strip():
                 buf.append(line)
+    # append last buffered block
     if cur and buf:
         (decl_blocks if cur=="DECL" else ex_blocks if cur=="EX" else pay_blocks).append(" ".join(buf))
 
     if not (len(decl_blocks)==len(ex_blocks)==len(pay_blocks)):
-        raise RuntimeError("Mismatched block counts")
+        raise RuntimeError("Mismatched block counts for ticker " + marker.strip())
 
     # Keep only last 3 payments
     if len(decl_blocks) > 3:
         decl_blocks = decl_blocks[-3:]
-        ex_blocks   = ex_blocks[-3:]
-        pay_blocks  = pay_blocks[-3:]
+        ex_blocks = ex_blocks[-3:]
+        pay_blocks = pay_blocks[-3:]
 
     rows = []
     dr = re.compile(r"\d{1,2}-[A-Za-z]{3}-\d{2,4}")
@@ -92,7 +93,8 @@ def parse_dates(text: str, marker: str):
             })
     return rows
 
-def write_csv(rows, fname):
+def write_csv(rows, ticker):
+    fname = f"{ticker.lower()}_dates.csv"
     with open(fname, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["declaration_date","ex_date","pay_date"])
         writer.writeheader()
@@ -103,8 +105,8 @@ def write_csv(rows, fname):
 def write_ics(rows, ticker, write_decl, write_ex, write_pay):
     settings = [
         ("declaration_date", f"{ticker} Declaration Date", write_decl),
-        ("ex_date",         f"{ticker} Ex-Dividend Date",  write_ex),
-        ("pay_date",        f"{ticker} Pay Date",          write_pay),
+        ("ex_date", f"{ticker} Ex-Dividend Date", write_ex),
+        ("pay_date", f"{ticker} Pay Date", write_pay),
     ]
     for field, title, enabled in settings:
         if not enabled:
@@ -141,12 +143,17 @@ def write_ics(rows, ticker, write_decl, write_ex, write_pay):
         print(f"Wrote {fname} with {len(rows)} events")
 
 def main():
+    tickers = [t.strip().upper() for t in TICKERS.split(",") if t.strip()]
     pdf_bytes = download_pdf(PDF_URL)
     text = extract_text(pdf_bytes)
-    rows = parse_dates(text, TICKER + " ")
-    csv_file = f"{TICKER.lower()}_dates.csv"
-    write_csv(rows, csv_file)
-    write_ics(rows, TICKER.upper(), WRITE_DECL, WRITE_EX, WRITE_PAY)
+
+    for ticker in tickers:
+        try:
+            rows = parse_dates(text, ticker + " ")
+            write_csv(rows, ticker)
+            write_ics(rows, ticker, WRITE_DECL, WRITE_EX, WRITE_PAY)
+        except Exception as e:
+            print(f"Error processing {ticker}: {e}")
 
 if __name__ == "__main__":
     main()

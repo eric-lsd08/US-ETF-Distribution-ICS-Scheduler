@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Downloads Vanguard’s 2025 dividend schedule PDF, extracts dates for a configured
-ETF ticker, normalizes all date formats, writes to CSV, and generates separate
+Downloads Vanguard’s 2025 dividend schedule PDF, extracts dates for configured
+ETF tickers, normalizes all date formats, writes to CSV, and generates separate
 all-day ICS files with an 8 PM local alarm (UTC+8) using a relative trigger.
+
 Configuration allows enabling/disabling each ICS output.
 """
 
@@ -15,16 +16,15 @@ import pdfplumber
 import pandas as pd
 from io import BytesIO
 from datetime import datetime, timedelta
-from pandas.tseries.offsets import BDay
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
 
 # === Configuration ===
-
-TICKER = "VOO"  # e.g. "VOO", "VPLS"
+TICKERS = ["VOO", "VPLS"]  # List of tickers, e.g. ["VOO", "VPLS"]
 PDF_URL = (
     "https://investor.vanguard.com/content/dam/retail/publicsite/en/documents/"
     "taxes/DIVDAT_012025.pdf"
 )
-OUTPUT_CSV = f"{TICKER.lower()}_dividend_schedule.csv"
 
 # Only “Ex-Dividend Date-1” alarms are enabled here; toggle as needed
 ENABLE_ICS = {
@@ -34,19 +34,13 @@ ENABLE_ICS = {
     "Payable Date": False,
 }
 
-ICS_FILES = {
-    "Record Date": f"{TICKER.lower()}_record_dates.ics",
-    "Ex-Dividend Date-1": f"{TICKER.lower()}_ex_minus_1_dates.ics",
-    "Ex-Dividend Date": f"{TICKER.lower()}_ex_dates.ics",
-    "Payable Date": f"{TICKER.lower()}_payable_dates.ics",
-}
-
 # Matches M/D/YY, M/D/YYYY, or YYYY/MM/DD
 DATE_PATTERN = re.compile(r"^(?P<m>\d{1,2})[/-](?P<d>\d{1,2})[/-](?P<y>\d{2}(?:\d{2})?)$")
-
 # For all-day events, local 20:00 is 20 hours after midnight → PT20H
 RELATIVE_TRIGGER = "PT20H"
 
+# Define a US business day offset (excludes weekends and US federal holidays)
+US_BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
 
 def download_pdf(url: str) -> BytesIO:
     resp = requests.get(url)
@@ -77,7 +71,8 @@ def parse_row(rec: str, exd: str, pay: str) -> dict:
     pay_norm = normalize_date(pay)
 
     ex_dt = datetime.strptime(ex_norm, "%m/%d/%y")
-    prev = ex_dt - BDay(1)
+    # Subtract one US business day
+    prev = ex_dt - US_BUSINESS_DAY
     ex_prev = f"{prev.month}/{prev.day}/{str(prev.year)[2:]}"
 
     quarter = (
@@ -118,6 +113,7 @@ def extract_schedule_for_ticker(pdf_stream: BytesIO, ticker: str) -> list[dict]:
                     normalize_date(pay)
                 except ValueError:
                     continue
+
                 schedule = [parse_row(rec, exd, pay)]
                 for extra in lines[i+1:]:
                     tok = extra.split()
@@ -149,11 +145,16 @@ def save_to_csv(data: list[dict], filename: str):
 
 def csv_to_separate_ics(csv_file: str, ticker: str):
     df = pd.read_csv(csv_file, dtype=str)
+    ics_files = {
+        "Record Date": f"{ticker.lower()}_record_dates.ics",
+        "Ex-Dividend Date-1": f"{ticker.lower()}_ex_minus_1_dates.ics",
+        "Ex-Dividend Date": f"{ticker.lower()}_ex_dates.ics",
+        "Payable Date": f"{ticker.lower()}_payable_dates.ics",
+    }
     for dt_type, enabled in ENABLE_ICS.items():
         if not enabled:
             continue
-
-        fname = ICS_FILES[dt_type]
+        fname = ics_files[dt_type]
         lines = [
             "BEGIN:VCALENDAR",
             "VERSION:2.0",
@@ -161,7 +162,6 @@ def csv_to_separate_ics(csv_file: str, ticker: str):
             "CALSCALE:GREGORIAN",
             "METHOD:PUBLISH",
         ]
-
         count = 0
         for _, row in df.iterrows():
             d = datetime.strptime(row[dt_type], "%m/%d/%y").date()
@@ -169,7 +169,6 @@ def csv_to_separate_ics(csv_file: str, ticker: str):
             dtend = (d + timedelta(days=1)).strftime("%Y%m%d")
             uid = str(uuid.uuid4())
             summary = f"{ticker} {row['Quarter']} – {dt_type}"
-
             lines.extend([
                 "BEGIN:VEVENT",
                 f"UID:{uid}",
@@ -184,27 +183,27 @@ def csv_to_separate_ics(csv_file: str, ticker: str):
                 "END:VEVENT",
             ])
             count += 1
-
         lines.append("END:VCALENDAR")
-
         with open(fname, "w", encoding="utf-8") as f:
             f.write("\r\n".join(lines) + "\r\n")
-
         print(f"Wrote {fname} ({count} events)")
 
 
 def main():
-    print(f"Ticker: {TICKER}")
+    print(f"Tickers: {', '.join(TICKERS)}")
     pdf = download_pdf(PDF_URL)
-    print("Extracting schedule…")
-    sched = extract_schedule_for_ticker(pdf, TICKER)
-    if not sched:
-        print(f"No records found for ticker {TICKER}.")
-        return
-    print(f"Found {len(sched)} entries. Saving CSV…")
-    save_to_csv(sched, OUTPUT_CSV)
-    print("Generating ICS files…")
-    csv_to_separate_ics(OUTPUT_CSV, TICKER)
+
+    for ticker in TICKERS:
+        print(f"Extracting schedule for {ticker}…")
+        sched = extract_schedule_for_ticker(pdf, ticker)
+        if not sched:
+            print(f"No records found for ticker {ticker}.")
+            continue
+        output_csv = f"{ticker.lower()}_dividend_schedule.csv"
+        print(f"Found {len(sched)} entries for {ticker}. Saving CSV…")
+        save_to_csv(sched, output_csv)
+        print(f"Generating ICS files for {ticker}…")
+        csv_to_separate_ics(output_csv, ticker)
 
 
 if __name__ == "__main__":
